@@ -7,9 +7,10 @@ services:
     restart: always
     ports:
       - 443:443
+    env_file: 
+      - .env
     environment:
-      - TOKEN=MTEyNzM3NzUxNjcwMTY5MjA4NQ.G56iXT.-TLOV96KYHkaz8e07q0gnfiNJPIbgBJRqO6mAk
-      - PREFIX=!
-      - CHANNEL_ID=1127393778328678440
+      - TOKEN=${TOKEN}
+      - PREFIX=${PREFIX}
     volumes:
       - ./bot:/bot

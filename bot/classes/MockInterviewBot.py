@@ -1,23 +1,30 @@
 import asyncio
 import os
 import random
+from collections import defaultdict
 
+import discord
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from discord.ext import commands
 
 
 class MockInterviewBot(commands.Bot):
     def __init__(self, *args, **kwargs):
-        # Channel id where the messages will be sent.
-        self.__CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
-        # The Id of the active 
-        self.__mock_interviews_participation_message_id = None
+        # Channels where the messages will be sent.
+        self.__channels = set()
+        # The active participation message of each guild.
+        self.__active_mock_interviews_participation_messages = defaultdict(lambda: None)
+        # The active no team user message of each guild.
+        self.__no_team_user_messages = defaultdict(lambda: None)
+        # The participants of the mock interviews of the week of each guild.
+        self.__mock_interview_participants = defaultdict(set)
+        # The mock interview teams of the week of each guild.
+        self.__mock_interview_teams = defaultdict(lambda: None)
+        # The user who has no team of the week of each guild.
+        self.__no_team_user = defaultdict(lambda: None)
+
         self.__mock_interviews_participation_message = None
-        self.__mock_interview_participants = set()
-        self.__mock_interview_teams = None
         self.__mock_interview_teams_message = None
-        # Store the user who has no team this week, if exists.
-        self.__no_team_user = None
 
         # Store the unicode code of some emojis.
         self.__emojis = {
@@ -40,20 +47,27 @@ class MockInterviewBot(commands.Bot):
     # Discord client methods #
     ##########################
     async def on_ready(self)->None:
-        """ Notifies that the client connected to Discord and Set up the cron jobs to send messages.
+        """ Setup the bot environment.
         """
         print(f'MockInterviewBot connected as {self.user.name}')
+
         if not self.SCHEDULER.get_jobs():
             self.SCHEDULER.add_job(self.__mock_interview_participation_job, 
                                    'cron', day_of_week='mon', hour=10)
-            
+
             self.SCHEDULER.add_job(self.__create_interview_teams_job,
                                    'cron', day_of_week='tue', hour=10)
-            
+
             self.SCHEDULER.add_job(self.__mock_interview_teams_job, 
                                    'cron', day_of_week='tue', hour=11)
 
             self.SCHEDULER.start()
+
+        # Retrieving all the channels where the bot will send the messages.
+        for channel in self.get_all_channels():
+            if channel.name == 'interviews':
+                self.__channels.add(channel)
+                print(f'Found interviews channel in {channel.guild.name}')
 
 
     async def on_reaction_add(self, reaction, user)->None:
@@ -66,21 +80,37 @@ class MockInterviewBot(commands.Bot):
         """
         if user == self.user:
             return
-        
-        if reaction.message.id == self.__mock_interviews_participation_message_id:
-            self.__mock_interview_participants.add(user)
-            message = f'{user.mention} joined to the mock interviews. {self.__emojis["CHECK"]}'
-            channel = reaction.message.channel
-            await self.__send_message(channel, message)
 
-        if reaction.message.id == self.no_team_user_message_id:
-            message = f'{user.mention} is the partner of ' + \
-                      f'{self.no_team_user_message_id.mention} this week. {self.__emojis["HANDSHAKE"]}'
-            self.no_team_user = None
-            channel = reaction.message.channel
-            await self.__send_message(channel, message)
-            # Delete the message because the lonely user has found a team.
-            await reaction.message.delete()
+        ## Getting the guild id where the reaction was added.
+        guild_id = reaction.message.guild.id
+        reaction_emoji = reaction.emoji
+
+        if reaction_emoji == self.__emojis['COMPUTER']:
+            # Verify if the reaction was added to the weekly mock interview message.
+            reacted_to_active_mock_interview_message = reaction.message == \
+                  self.__active_mock_interviews_participation_messages[guild_id]
+
+            if reacted_to_active_mock_interview_message:
+                self.__mock_interview_participants[guild_id].add(user)
+                message = f'{user.mention} joined to the mock interviews. {self.__emojis["CHECK"]}'
+                channel = reaction.message.channel
+                await self.__send_message(channel, message)
+
+        elif reaction_emoji == self.__emojis['HAND_SPLAYED']:
+            # Verify if the reaction was added to the active no team user message.
+            reacted_to_active_no_team_user_message = reaction.message == \
+                    self.__no_team_user_messages[guild_id]
+            
+            can_team_up = user != self.__no_team_user[guild_id]
+            
+            if reacted_to_active_no_team_user_message and can_team_up:
+                message = f'{user.mention} is the partner of ' + \
+                        f'{self.__no_team_user[guild_id].mention} this week. {self.__emojis["HANDSHAKE"]}'
+                self.__no_team_user[guild_id] = None
+                channel = reaction.message.channel
+                await self.__send_message(channel, message)
+                # Delete the message because the no team user has found a team.
+                await reaction.message.delete()
 
 
     async def on_reaction_remove(self, reaction, user)->None:
@@ -92,54 +122,78 @@ class MockInterviewBot(commands.Bot):
         """
         if user == self.user:
             return
-        
-        if reaction.message.id == self.__mock_interviews_participation_message_id:
-            self.__mock_interview_participants.remove(user)
+
+        guild_id = reaction.message.guild.id
+        removed_reaction_in_active_mock_interview_message = reaction.message == \
+                self.__active_mock_interviews_participation_messages[guild_id]
+
+        if removed_reaction_in_active_mock_interview_message:
+            self.__mock_interview_participants[guild_id].remove(user)
             message = f'{user.mention} left the mock interviews. {self.__emojis["X"]}'
             channel = reaction.message.channel
             await self.__send_message(channel, message)
+
+
+    async def on_guild_join(self, guild)->None:
+        """Handles when the bot joins a server.
+        """
+        interviews_channel = discord.utils.get(guild.channels, name='interviews')
+        
+        if interviews_channel:
+            self.__channels.add(interviews_channel)
+            welcome_message = f'Hello! I\'m MockInterviewBot. I will help you to organize the mock interviews of the week.\n\n'
+            await self.__send_message(interviews_channel, welcome_message)
+        else:
+            print(f'No interviews channel found in {guild.name}')
 
 
     ####################
     # Cron job methods #
     ####################
     async def __mock_interview_participation_job(self)->None:
-        self.__mock_interview_participants.clear()
-        channel = self.get_channel(int(os.getenv('CHANNEL_ID')))
+        """Sends the message to participate in the mock interviews of the week to each guild.
+        """
+        # Clear the participants of the mock interviews of the week of each guild.
+        for participants in self.__mock_interview_participants.values():
+            participants.clear()
+
         self.__mock_interviews_participation_message = self.__get_mock_interview_participation_message()
-        discord_message = await self.__send_message(channel, 
-                                                    self.__mock_interviews_participation_message)
-        self.__react_to_a_message(discord_message, self.__emojis['COMPUTER'])
+
+        for channel in self.__channels:
+            guild_id = channel.guild.id
+            discord_message = await self.__send_message(channel, 
+                                                        self.__mock_interviews_participation_message)
+            await self.__react_to_a_message(discord_message, self.__emojis['COMPUTER'])
+
+            # Update the active participation message of the guild.
+            self.__active_mock_interviews_participation_messages[guild_id] = discord_message
 
 
     async def __mock_interview_teams_job(self)->None:
-        """Sends the message with the mock interview teams.
+        """Sends the message with the mock interview teams to each guild.
         """
-        channel = self.get_channel(int(os.getenv('CHANNEL_ID')))
-        self.__mock_interview_teams_message = self.__get_interview_teams_message()
-        await self.__send_message(channel, self.__mock_interview_teams_message)
-        
-        if self.__no_team_user:
-            no_team_user_message = self.__get_no_team_user_message(self.__no_team_user)
-            discord_message = await self.__send_message(channel, no_team_user_message)
-            self.__react_to_a_message(discord_message, self.__emojis['HAND_SPLAYED'])
+        for channel in self.__channels:
+            guild_id = channel.guild.id
+            teams = self.__mock_interview_teams[guild_id]
+            self.__mock_interview_teams_message = self.__get_interview_teams_message(teams)
+            has_no_team_user = self.__no_team_user[guild_id] != None
 
-    
+            await self.__send_message(channel, self.__mock_interview_teams_message)
+
+            if has_no_team_user:
+                no_team_user = self.__no_team_user[guild_id]
+                no_team_user_message = self.__get_no_team_user_message(no_team_user)
+                discord_message = await self.__send_message(channel, no_team_user_message)
+                # Update the active no team user message of the guild.
+                self.__no_team_user_messages[guild_id] = discord_message
+                await self.__react_to_a_message(discord_message, self.__emojis['HAND_SPLAYED'])
+
+
     async def __create_interview_teams_job(self):
         """Creates the mocking interview teams of the week.
         """
-        if len(self.__mock_interview_participants) < 2:
-            self.__mock_interview_teams = None
-            return
-        
-        interview_participants = list(self.__mock_interview_participants)
-
-        if len(interview_participants) % 2 != 0:
-            interview_participants.append(None)
-
-        random.shuffle(interview_participants)
-        self.__mock_interview_teams = zip(interview_participants[0::2], 
-                                          interview_participants[1::2])
+        for guild_id, participants in self.__mock_interview_participants.items():
+            self.__mock_interview_teams[guild_id] = self.__create_interview_teams(participants)
 
 
     ###############################
@@ -156,23 +210,23 @@ class MockInterviewBot(commands.Bot):
                 The discord message object.
         """
         discord_message = await channel.send(message)
-        self.__mock_interviews_participation_message_id = discord_message.id
 
         return discord_message
-    
-    def __react_to_a_message(self, message, reaction:str)->None:
+
+
+    async def __react_to_a_message(self, message, reaction:str)->None:
         """Adds the specified reaction to the message.
 
         Args:
             message: The message where the reaction will be added.
             reaction (str): The reaction in unicode format.
         """
-        message.add_reaction(reaction)
+        await message.add_reaction(reaction)
 
 
-    #############################
-    # Message generator methods #
-    #############################
+    #################
+    # Utils methods #
+    #################
     def __get_mock_interview_participation_message(self)->str:
         """Generates the message to participate in the mock interviews of the week.
 
@@ -186,7 +240,7 @@ class MockInterviewBot(commands.Bot):
                     'in the mock interview teams.**\n\n'
 
         return message
-    
+
 
     def __get_no_team_user_message(self, no_team_user)->str:
         """Generates the message to show the user who has no team.
@@ -204,25 +258,51 @@ class MockInterviewBot(commands.Bot):
         return message
 
 
-    def __get_interview_teams_message(self)->str:
+    def __get_interview_teams_message(self, teams)->str:
         """Generate the message to show the mock interview teams.
 
             Returns:
                 str: The message to show the mock interview teams.
         """
 
-        if not self.__mock_interview_teams:
+        if not teams:
             return f'@everyone\nThere are no enough people to create mock interview teams! {self.__emojis["SAD"]}'
-        
+
         message = '@everyone\nThe mock interview teams has been created!.\n'
         message += f'Please get in touch with your team to agree on a date and time for the interviews. {self.__emojis["DATE"]}\n\n'
         message += f'Good luck! {self.__emojis["NERD"]}\n\n'
         message += 'Mock interview teams:\n'
-        
-        for participant1, participant2 in self.__mock_interview_teams:
+
+        print(teams, type(teams))
+
+        for participant1, participant2 in teams:
             if participant1 and participant2:
                 message += f'{participant1.mention} - {participant2.mention} {self.__emojis["HANDSHAKE"]}\n'
             else:
                 self.__no_team_user = participant1 if participant1 else participant2
 
         return message
+
+
+    def __create_interview_teams(self, participants)->None:
+        """Creates the mock interview teams of the week.
+
+            Args:
+                participants (set): The participants of the mock interviews of the week.
+
+            Returns:
+                The mock interview teams of the week or None if there are no enough people.
+        """
+        teams = None
+
+        if len(participants) > 1:
+            interview_participants = list(participants)
+
+            if len(interview_participants) % 2 != 0:
+                interview_participants.append(None)
+
+            random.shuffle(interview_participants)
+            teams = zip(interview_participants[0::2], 
+                                            interview_participants[1::2])
+
+        return teams
